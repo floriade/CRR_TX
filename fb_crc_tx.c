@@ -8,6 +8,7 @@
  * Subject to the GPL.
  */
 
+
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/spinlock.h>
@@ -30,14 +31,14 @@
 #define WIN_SZ		2
 #define MAX_OPEN_PKTS	2
 #define MAX_QUEUE_LEN	500
-#define MAX_RTT		1000 /* depends on jiffy */
+#define MAX_RTT		2*HZ
 
 struct fb_crr_tx_priv {
 	idp_t port[2];
 	seqlock_t lock;
 	rwlock_t tx_lock;
-	unsigned char tx_open_pkts;
-	unsigned char tx_seq_nr;
+	unsigned char *tx_open_pkts;
+	unsigned char *tx_seq_nr;
 	struct sk_buff_head *tx_stack_list;
 	struct sk_buff_head *tx_queue_list;
 	struct timer_list *timer1;
@@ -45,46 +46,64 @@ struct fb_crr_tx_priv {
 };
 
 struct mytimer {
-	unsigned char nr;
 	unsigned char *open_pkts;
-	struct timer_list *mytimer;
+	struct timer_list mytimer;
 	struct sk_buff_head *stack_list;
 	rwlock_t *tx_lock;
 };
 
+struct mytimer my_timer[WIN_SZ];
+
 static struct sk_buff *skb_get_nr(unsigned char n, struct sk_buff_head *list)
 {
-	int i;
+
 	struct sk_buff *curr = list->next;
 
-	for (i = 1; i < n; i++)
-		curr = curr->next;
-
-	return curr;
+	while (1) {
+		if ((*(curr->data + ETH_HDR_LEN) >> 4) == n)
+			return curr;
+		else {
+			if ((curr = curr->next) == (struct sk_buff *)list)
+				return 0;
+		}
+	}
 }
 
-/* returns a pointer to the skb_buff with the following seq number */
-static struct sk_buff *skb_get_pos(unsigned char seq, struct sk_buff_head *list)
+/* returns a pointer to the skb_buff with the according seq number */
+/*static struct sk_buff *skb_get_pos(unsigned char seq, struct sk_buff_head *list)
 {
 	struct sk_buff *curr = list->next;
 
-	/* list is empty */
-	if (list->next == list->prev)
-		return list->next;
-	/* Second element */
-	else if (seq == 2)
-		return list->next;
-	/* others */
-	while(1) {
-	if (curr->cb[47] > seq)
-		break;
+	if (seq < 0 || seq > (2 * WIN_SZ))
+		return 0;
 
-		if (curr->next == list->next)
+	if (list->next == (struct sk_buff *)list) {				// list is empty 
+		printk(KERN_ERR "List is empty\n");		
+		return list->next;
+	}
+	
+	else if (seq == 2) {							// Second element 
+		printk(KERN_ERR "Seqnr 2 -> First element\n");
+		return list->next;
+	}	
+		
+	while(1) {								// Others 
+		if ((*(curr->data + ETH_HDR_LEN) >> 4) > seq)
 			break;
+		else if ((*(curr->data + ETH_HDR_LEN) >> 4) == seq) {		// identical copy 
+			printk(KERN_ERR "Identical copy exists\n");
+			return 0;
+		}
+	
+		if (curr->next == (struct sk_buff *)list) {
+			printk(KERN_ERR "Reached end of the list\n");
+			return (struct sk_buff *)list;
+		}
 		curr = curr->next;
 	}
 	return curr;
-}
+}*/
+
 
 /* Timeout:
  * 1.) Get oldest packet from stack.
@@ -99,29 +118,44 @@ static void fb_crr_tx_timeout(unsigned long args)
 {
 	struct sk_buff *curr, *cloned_skb;
 	struct mytimer *timer = (struct mytimer *)args;
-	/* send pkt again. first in list is oldest*/
-	write_lock(timer->tx_lock);
-	if ((curr = skb_dequeue(timer->stack_list)) == NULL) {
-		printk(KERN_ERR "Error: Stack is empty!\n"); /* BUG */
-		timer->open_pkts -=1;
-		write_unlock(timer->tx_lock);	
+	
+	printk(KERN_ERR "Timeout!\n");
+
+	write_lock_bh(timer->tx_lock);						// LOCK
+	printk(KERN_ERR "Timer LOCKED!\n");			
+	if (*timer->open_pkts == 0) {
+		printk(KERN_ERR "No open packets\n");
+		//mod_timer(&timer->mytimer, jiffies + 10*HZ);			// restart timer 
+		write_unlock_bh(timer->tx_lock);				// UNLOCK
+		printk(KERN_ERR "Timer UNLOCKED!\n");
+		return;
+	}	
+
+	curr = skb_dequeue(timer->stack_list);
+		
+	if (curr == NULL) {							// W send pkt again. first in list is oldest
+		printk(KERN_ERR "Error: Stack is empty!\n"); 			// BUG should never happen!
+		timer->open_pkts -=1;						// W 
+		write_unlock_bh(timer->tx_lock);				// UNLOCKa
+		printk(KERN_ERR "Timer UNLOCKED!\n");
 		return;
 	}
 
+	printk(KERN_ERR "Open packet is resent!\n"); 	
 	skb_queue_tail(timer->stack_list, curr);
 
 	if ((cloned_skb = skb_copy(curr, GFP_ATOMIC))) {
-		/* idp should be correct. schedule for egress path */
-		engine_backlog_tail(cloned_skb, TYPE_EGRESS);
+		
+		engine_backlog_tail(cloned_skb, TYPE_EGRESS);			// idp should be correct. schedule for egress path 
 	}
 	else {
 		printk(KERN_ERR "Error: Couldn't copy!\n");
 		timer->open_pkts -=1;
 	}
 
-	/* restart timer */
-	mod_timer(timer->mytimer, jiffies + MAX_RTT);
-	write_unlock(timer->tx_lock);	
+	mod_timer(&timer->mytimer, jiffies + HZ);				// restart timer 
+	write_unlock_bh(timer->tx_lock);					// UNLOCKb
+	printk(KERN_ERR "Timer UNLOCKED!\n");
 }
 
 static int fb_crr_tx_netrx(const struct fblock * const fb,
@@ -129,7 +163,7 @@ static int fb_crr_tx_netrx(const struct fblock * const fb,
 			  enum path_type * const dir)
 {
 	int drop = 0;
-	unsigned int queue_length;
+	unsigned int queue_len;
 	unsigned char custom, seq, ack, currseq;
 	struct sk_buff *cloned_skb, *curr;
 	struct fb_crr_tx_priv __percpu *fb_priv_cpu;
@@ -145,94 +179,130 @@ static int fb_crr_tx_netrx(const struct fblock * const fb,
 		if (fb_priv_cpu->port[*dir] == IDP_UNKNOWN)
 			drop = 1;
 	} while (read_seqretry(&fb_priv_cpu->lock, seq));
-	/* Send */
-	if (*dir == TYPE_EGRESS && ntohs(eth_hdr(skb)->h_proto) == 0xabba) {
-		currseq = *(skb->data + ETH_HDR_LEN) = (fb_priv_cpu->tx_seq_nr % (2 * WIN_SZ))+ 1; /* tag packet with seq nr */
-		fb_priv_cpu->tx_seq_nr = (fb_priv_cpu->tx_seq_nr + 1) % (2 * WIN_SZ);
-		queue_length = skb_queue_len(fb_priv_cpu->tx_queue_list);
+
+	custom = *(skb->data + ETH_HDR_LEN);
+	seq = custom >> 4;
+	ack = custom & 0xF;
+	
+	if (*dir == TYPE_EGRESS && ntohs(eth_hdr(skb)->h_proto) == 0xabba) {	// Send 
+		printk(KERN_ERR "Send packet\n");
+		write_lock_bh(&fb_priv_cpu->tx_lock);				// LOCK
+		printk(KERN_ERR "Send UNLOCKED!\n");
+		currseq = *fb_priv_cpu->tx_seq_nr; 				// R tag packet with seq nr 
+		*fb_priv_cpu->tx_seq_nr = (*fb_priv_cpu->tx_seq_nr % (2*WIN_SZ)) + 1; // W Increment seq nr for next packet 
+		*(skb->data + ETH_HDR_LEN) = currseq << 4;		
+		queue_len = skb_queue_len(fb_priv_cpu->tx_queue_list);		// R 
+		printk(KERN_ERR "Currseq: %d\tQlen: %d\n", currseq, queue_len);
 												
-		if (fb_priv_cpu->tx_open_pkts > MAX_OPEN_PKTS) {		/* Queue packet*/
-			if (queue_length < MAX_QUEUE_LEN) {
-				skb_queue_tail(fb_priv_cpu->tx_queue_list, skb);
+		if (*fb_priv_cpu->tx_open_pkts == MAX_OPEN_PKTS) {		// R Queue packet
+			printk(KERN_ERR "Open packets: %d\n", *fb_priv_cpu->tx_open_pkts);
+			if (queue_len < MAX_QUEUE_LEN) {
+				printk(KERN_ERR "Add to queue\n");
+				skb_queue_tail(fb_priv_cpu->tx_queue_list, skb);// W 
+				write_unlock_bh(&fb_priv_cpu->tx_lock);		// UNLOCKa
+				printk(KERN_ERR "Send UNLOCKED!\n");
 				drop = 2;
 			}
 			else {
+				write_unlock_bh(&fb_priv_cpu->tx_lock);		// UNLOCKb
+				printk(KERN_ERR "Send UNLOCKED!\n");
 				printk(KERN_ERR "Queue is full!\n");
 				drop = 1;	
 			}
 		}
-		else {								/* Send packet and write to stack */
-			if (queue_length) {					/* Check if packets in queue need to be send first */
-				skb_queue_tail(fb_priv_cpu->tx_queue_list, skb);/* Queue at end of queue_list */
-				curr = skb_dequeue(fb_priv_cpu->tx_queue_list);	/* Dequeue first element of queue_list */
-				skb_queue_tail(fb_priv_cpu->tx_stack_list, curr);/* Queue at end of stack_list */			
+		else {
+			printk(KERN_ERR "Packet slots available\n");		// Send packet and write to stack 
+			if (queue_len) {					// Check if packets in queue need to be send first 
+				printk(KERN_ERR "Send other packet from queue\n");
+				skb_queue_tail(fb_priv_cpu->tx_queue_list, skb);// W Queue at end of queue_list 
+				curr = skb_dequeue(fb_priv_cpu->tx_queue_list);	// W Dequeue first element of queue_list 
+				skb_queue_tail(fb_priv_cpu->tx_stack_list, curr);// W Queue at end of stack_list 			
 				drop = 2;
 			}
-			/* send packet and push on stack */
-			else {
-				skb_queue_tail(fb_priv_cpu->tx_stack_list, skb);
+			else {							// send packet and push on stack 
+				printk(KERN_ERR "Push packet on stack and send\n");
+				skb_queue_tail(fb_priv_cpu->tx_stack_list, skb);// W 
 				curr = skb;
 			}
 
-			if ((cloned_skb = skb_copy(curr, GFP_ATOMIC))) 
-				engine_backlog_tail(cloned_skb, TYPE_EGRESS);	/* idp and seq_nr should be correct. schedule for egress path */
+			if ((cloned_skb = skb_copy(curr, GFP_ATOMIC))) { 	Test without sending packet
+				engine_backlog_tail(cloned_skb, TYPE_EGRESS);	// idp and seq_nr should be correct. schedule for egress path 
+				printk(KERN_ERR "Sent\n");			
+			}
 			else
-				printk(KERN_ERR "Error: Couldn't copy!\n");
-			
-			if (!(currseq % 2))
-				mod_timer(fb_priv_cpu->timer2, jiffies + MAX_RTT);
-			else
-				mod_timer(fb_priv_cpu->timer1, jiffies + MAX_RTT);
+				printk(KERN_ERR "Error: Couldn't copy!\n");			
 
-			fb_priv_cpu->tx_open_pkts++;
+			(*fb_priv_cpu->tx_open_pkts)++;				// W 
+
+			if (!(currseq % 2))
+				mod_timer(&my_timer[1].mytimer, jiffies + 10*HZ);// W 
+			else
+				mod_timer(&my_timer[0].mytimer, jiffies + 10*HZ);// W 
+			printk(KERN_ERR "Reset timer\n");
+
+			write_unlock_bh(&fb_priv_cpu->tx_lock);			// UNLOCKc
+			printk(KERN_ERR "Send UNLOCKED!\n");
 		}
 	}
 	/* Receive */
-	else if (*dir == TYPE_INGRESS && ntohs(eth_hdr(skb)->h_proto) == 0xabba) {
-		queue_length = skb_queue_len(fb_priv_cpu->tx_queue_list);
-		custom = *(skb->data + ETH_HDR_LEN);
-		seq = custom >> 4;
-		ack = custom & 0xF;
-		if (ack == 0xF) {						/* ACK received */
-			if ((seq % 2) == 0)					/* Timer 2 */
-				del_timer(fb_priv_cpu->timer2);
-			else							/* Timer 1 */
-				del_timer(fb_priv_cpu->timer1);
-		
-			fb_priv_cpu->tx_open_pkts--;
+	else if (*dir == TYPE_INGRESS && ntohs(eth_hdr(skb)->h_proto) == 0xabba	// ACK received 
+		&& ack == 0xF) {
+		printk(KERN_ERR "ACK received\n");
+				
+		write_lock_bh(&fb_priv_cpu->tx_lock);				// LOCK
+		printk(KERN_ERR "Receive LOCKED!\n");
 
-			curr = skb_get_nr(seq, fb_priv_cpu->tx_stack_list);	/* get according element */
-			skb_unlink(curr, fb_priv_cpu->tx_stack_list);		/* dequeue from list */
-			kfree(curr);						/* delete pkt from stack */
-			drop = 1;						/* drop pkt before user space */
+		if ((seq % 2) == 0)				
+			del_timer(fb_priv_cpu->timer2);				// W Stop Timer 2 
+		else							
+			del_timer(fb_priv_cpu->timer1);				// W Stop Timer 1 
+		printk(KERN_ERR "Timer stopped for seq nr %d\n", seq);
+
+		(*fb_priv_cpu->tx_open_pkts)--;					// W 
+
+		if ((curr = skb_get_nr(seq, fb_priv_cpu->tx_stack_list))) {	// R get according element 
+			skb_unlink(curr, fb_priv_cpu->tx_stack_list);		// W dequeue from list 
+			kfree(curr);
 		}
+		printk(KERN_ERR "Deleted from stack\n");			// delete pkt from stack 
+		drop = 1;							// drop pkt before user space 
 
+		queue_len = skb_queue_len(fb_priv_cpu->tx_queue_list);		// R 
+		printk(KERN_ERR "Qlen: %d\tOpen pkts: \n", queue_len);
 
+		if (queue_len) {						// && *fb_priv_cpu->tx_open_pkts <= MAX_OPEN_PKTS) { /* R 
+			curr = skb_dequeue(fb_priv_cpu->tx_queue_list);		// W Dequeue first element of queue_list 
+			skb_queue_tail(fb_priv_cpu->tx_stack_list, curr);	// W Queue at end of stack_list 
 
-		if (queue_length && fb_priv_cpu->tx_open_pkts <= MAX_OPEN_PKTS) {
-			curr = skb_dequeue(fb_priv_cpu->tx_queue_list);		/* Dequeue first element of queue_list */
-			skb_queue_tail(fb_priv_cpu->tx_stack_list, curr);	/* Queue at end of stack_list */
-
-			if ((cloned_skb = skb_copy(curr, GFP_ATOMIC))) 
-				engine_backlog_tail(cloned_skb, TYPE_EGRESS);	/* idp and seq_nr should be correct. schedule for egress path */
+			if ((cloned_skb = skb_copy(curr, GFP_ATOMIC)))  {
+				printk(KERN_ERR "Sent\n");
+				engine_backlog_tail(cloned_skb, TYPE_EGRESS);	// idp and seq_nr should be correct. schedule for egress path 
+			}
 			else
 				printk(KERN_ERR "Error: Couldn't copy!\n");
-			
-			if (!(seq % 2))						/* Start timers */
-				mod_timer(fb_priv_cpu->timer2, jiffies + MAX_RTT);
-			else
-				mod_timer(fb_priv_cpu->timer1, jiffies + MAX_RTT);
 
-			fb_priv_cpu->tx_open_pkts++;		
+			(*fb_priv_cpu->tx_open_pkts)++;				// W 	
+		
+			if (!(seq % 2))						// Start timers 
+				mod_timer(&my_timer[1].mytimer, jiffies +10*HZ); // W 
+			else
+				mod_timer(&my_timer[0].mytimer, jiffies + 10*HZ); // W 
+			printk(KERN_ERR "Started timer\n");
 		}
+		write_unlock_bh(&fb_priv_cpu->tx_lock);				// UNLOCK
+		printk(KERN_ERR "Receive UNLOCKED!\n");
 	}
 
 	if (drop == 1) {
 		kfree_skb(skb);
+		//printk(KERN_ERR "Freed and dropped!\n");
 		return PPE_DROPPED;
 	}
-	else if (drop == 2)
+	else if (drop == 2) {
+		printk(KERN_ERR "Dropped!\n");
 		return PPE_DROPPED;
+	}
+	printk(KERN_ERR "Passed on!\n");
 	return PPE_SUCCESS;
 }
 
@@ -314,10 +384,9 @@ static int fb_crr_tx_event(struct notifier_block *self, unsigned long cmd,
 static struct fblock *fb_crr_tx_ctor(char *name)
 {
 	int ret = 0;
-	unsigned int cpu;
-	struct timer_list tmp_timer1, tmp_timer2;
-	struct sk_buff_head *tmp_list1, *tmp_list2;
-	struct mytimer *timer1_arg, *timer2_arg;
+	unsigned char *tmp_open_pkts, *tmp_seq_nr;
+	unsigned int i, cpu;
+	struct sk_buff_head *tmp_stack_list, *tmp_queue_list;
 	struct fblock *fb;
 	struct fb_crr_tx_priv __percpu *fb_priv;
 
@@ -329,38 +398,37 @@ static struct fblock *fb_crr_tx_ctor(char *name)
 	if (!fb_priv)
 		goto err;
 
-	if (unlikely((tmp_list1 = kzalloc(sizeof(struct sk_buff_head), GFP_ATOMIC)) == NULL)) {
+	if (unlikely((tmp_open_pkts = kzalloc(sizeof(unsigned char), GFP_ATOMIC)) == NULL)) {
+		printk(KERN_ERR "Allocation failed!\n");
+		goto erra;
+	}
+
+	if (unlikely((tmp_seq_nr = kzalloc(sizeof(unsigned char), GFP_ATOMIC)) == NULL)) {
+		printk(KERN_ERR "Allocation failed!\n");
+		goto errb;
+	}
+
+	if (unlikely((tmp_stack_list = kzalloc(sizeof(struct sk_buff_head), GFP_ATOMIC)) == NULL)) {
 		printk(KERN_ERR "Allocation failed!\n");
 		goto err1;
 	}
 
-		if (unlikely((tmp_list2 = kzalloc(sizeof(struct sk_buff_head), GFP_ATOMIC)) == NULL)) {
+	if (unlikely((tmp_queue_list = kzalloc(sizeof(struct sk_buff_head), GFP_ATOMIC)) == NULL)) {
 		printk(KERN_ERR "Allocation failed!\n");
 		goto err1a;
 	}
 
-	if (unlikely((timer1_arg = kzalloc(sizeof(struct mytimer), GFP_ATOMIC)) == NULL)) {
-		printk(KERN_ERR "Allocation failed!\n");
-		goto err1b;
+	*tmp_open_pkts = 0;
+	*tmp_seq_nr = 1;
+
+	skb_queue_head_init(tmp_stack_list);
+	skb_queue_head_init(tmp_queue_list);
+
+	for (i = 0; i < WIN_SZ; i++) {
+		init_timer(&my_timer[i].mytimer);
+		my_timer[i].open_pkts = tmp_open_pkts;
+		my_timer[i].stack_list = tmp_stack_list;
 	}
-
-	if (unlikely((timer2_arg = kzalloc(sizeof(struct mytimer), GFP_ATOMIC)) == NULL)) {
-		printk(KERN_ERR "Allocation failed!\n");
-		goto err1c;
-	}
-
-	timer1_arg->nr = 1;
-	timer1_arg->mytimer = &tmp_timer1;
-	timer1_arg->stack_list = tmp_list2;
-
-	timer2_arg->nr = 2;
-	timer2_arg->mytimer = &tmp_timer2;
-	timer2_arg->stack_list = tmp_list2;
-
-	skb_queue_head_init(tmp_list1);
-	skb_queue_head_init(tmp_list2);
-	init_timer(&tmp_timer1);
-	init_timer(&tmp_timer1);
 
 	get_online_cpus();
 	for_each_online_cpu(cpu) {
@@ -368,26 +436,23 @@ static struct fblock *fb_crr_tx_ctor(char *name)
 		fb_priv_cpu = per_cpu_ptr(fb_priv, cpu);
 		seqlock_init(&fb_priv_cpu->lock);
 		rwlock_init(&fb_priv_cpu->tx_lock);
-		timer1_arg->tx_lock = timer2_arg->tx_lock = &fb_priv_cpu->tx_lock;
-		timer1_arg->open_pkts = timer2_arg->open_pkts = &fb_priv_cpu->tx_open_pkts;
+		my_timer[0].tx_lock = &fb_priv_cpu->tx_lock;
+		my_timer[1].tx_lock = &fb_priv_cpu->tx_lock;
 		fb_priv_cpu->port[0] = IDP_UNKNOWN;
 		fb_priv_cpu->port[1] = IDP_UNKNOWN;
-		fb_priv_cpu->tx_open_pkts = 0;
-		fb_priv_cpu->tx_seq_nr = 0;
-		fb_priv_cpu->tx_stack_list = tmp_list1;
-		fb_priv_cpu->tx_queue_list = tmp_list2;
-		fb_priv_cpu->timer1 = &tmp_timer1;
-		fb_priv_cpu->timer2 = &tmp_timer2;
+		fb_priv_cpu->tx_open_pkts = tmp_open_pkts;
+		fb_priv_cpu->tx_seq_nr = tmp_seq_nr;
+		fb_priv_cpu->tx_stack_list = tmp_stack_list;
+		fb_priv_cpu->tx_queue_list = tmp_queue_list;
 	}
 	put_online_cpus();
 
-	tmp_timer1.expires = 0;
-	tmp_timer1.function = fb_crr_tx_timeout;
-	tmp_timer1.data = (unsigned long) timer1_arg;
-
-	tmp_timer2.expires = 0;
-	tmp_timer2.function = fb_crr_tx_timeout;
-	tmp_timer2.data = (unsigned long) timer2_arg;
+	for (i = 0; i < WIN_SZ; i++) {
+		my_timer[i].mytimer.expires = jiffies + 10*HZ;
+		my_timer[i].mytimer.function = fb_crr_tx_timeout;
+		my_timer[i].mytimer.data = (unsigned long)&my_timer[i];
+		add_timer(&my_timer[i].mytimer);
+	}
 
 	ret = init_fblock(fb, name, fb_priv);
 	if (ret)
@@ -398,21 +463,21 @@ static struct fblock *fb_crr_tx_ctor(char *name)
 	if (ret)
 		goto err3;
 	__module_get(THIS_MODULE);
-	printk(KERN_ERR "Initialization passed!\n");
+	printk(KERN_ERR "[CRR TX] Initialization passed!\n");
 	return fb;
 err3:
 	cleanup_fblock_ctor(fb);
 err2:
-	del_timer_sync(&tmp_timer1);
-	del_timer_sync(&tmp_timer2);
-	kfree(timer2_arg);
-err1c:
-	kfree(timer1_arg);
-err1b:
-	kfree(tmp_list2);
+	del_timer_sync(&my_timer[0].mytimer);
+	del_timer_sync(&my_timer[1].mytimer);
+	kfree(tmp_queue_list);
 err1a:
-	kfree(tmp_list1);
+	kfree(tmp_stack_list);
 err1:
+	kfree(tmp_seq_nr);
+errb:
+	kfree(tmp_open_pkts);	
+erra:
 	free_percpu(fb_priv);
 err:
 	kfree_fblock(fb);
@@ -421,46 +486,56 @@ err:
 
 static void fb_crr_tx_dtor(struct fblock *fb)
 {
-	int i;
+	int i, queue_len;
 	struct fb_crr_tx_priv *fb_priv_cpu;
 	struct fb_crr_tx_priv __percpu *fb_priv;
 	struct sk_buff *tmp_skb;
 
+	printk(KERN_ERR "[CRR TX] Deinit Start!\n");
+	for (i = 0; i < WIN_SZ; i++)
+		del_timer(&my_timer[i].mytimer);
+
 	rcu_read_lock();
 	fb_priv = (struct fb_crr_tx_priv __percpu *) rcu_dereference_raw(fb->private_data);
-	fb_priv_cpu = per_cpu_ptr(fb_priv, 0);	/* CPUs share same priv. d */
+	fb_priv_cpu = per_cpu_ptr(fb_priv, 0);					/* CPUs share same priv. d */
 	rcu_read_unlock();
 
-	write_lock(&fb_priv_cpu->tx_lock);
+	write_lock_bh(&fb_priv_cpu->tx_lock);					/* LOCK */
+	printk(KERN_ERR "[CRR TX] Deinit LOCKED!\n");
+	del_timer_sync(&my_timer[0].mytimer);
+	del_timer_sync(&my_timer[1].mytimer);
+	printk(KERN_ERR "[CRR TX] Deinit Timers stopped\n");
 
-	/* delete remaining elements in stack list */
-	/* TODO: use temp variable to store skb_queue_empty(list) */
-	for (i = 0; i < fb_priv_cpu->tx_stack_list->qlen; i++) {
-		tmp_skb = fb_priv_cpu->tx_stack_list->next;
-		skb_unlink(fb_priv_cpu->tx_stack_list->next, fb_priv_cpu->tx_stack_list);
+	queue_len = skb_queue_len(fb_priv_cpu->tx_stack_list);
+	printk(KERN_ERR "[CRR TX] Deinit Qlen stack: %d\n", queue_len);
+	
+	for (i = 0; i < queue_len; i++) {					/* delete remaining elements in stack list */
+		tmp_skb = skb_dequeue(fb_priv_cpu->tx_stack_list);
 		kfree(tmp_skb);
 	}
-	/* delete remaining elements in queue list */
-	for (i = 0; i < fb_priv_cpu->tx_queue_list->qlen; i++) {
-		tmp_skb = fb_priv_cpu->tx_queue_list->next;
-		skb_unlink(fb_priv_cpu->tx_queue_list->next, fb_priv_cpu->tx_queue_list);
+	printk(KERN_ERR "[CRR TX] Deinit Qlen queue: %d\n", queue_len);
+	queue_len = skb_queue_len(fb_priv_cpu->tx_queue_list);
+
+	for (i = 0; i < queue_len; i++) {					/* delete remaining elements in queue list */
+		tmp_skb = skb_dequeue(fb_priv_cpu->tx_queue_list);		
 		kfree(tmp_skb);
 	}
-
-	del_timer_sync(fb_priv_cpu->timer1);
-	del_timer_sync(fb_priv_cpu->timer2);
-
-	kfree(&fb_priv_cpu->timer1->data);
-	kfree(&fb_priv_cpu->timer2->data);
+	printk(KERN_ERR "[CRR TX] Deinit Queues cleaned\n");
 
 	kfree(fb_priv_cpu->tx_stack_list);
 	kfree(fb_priv_cpu->tx_queue_list);
+	printk(KERN_ERR "[CRR TX] Deinit lists freed\n");
 
-	write_unlock(&fb_priv_cpu->tx_lock);
+	kfree(fb_priv_cpu->tx_open_pkts);
+	kfree(fb_priv_cpu->tx_seq_nr);
+	printk(KERN_ERR "[CRR TX] Deinit pkts and seq freed\n");
+
+	write_unlock_bh(&fb_priv_cpu->tx_lock);					// UNLOCK
+	printk(KERN_ERR "[CRR TX] Deinit UNLOCKED!\n");
 
 	free_percpu(rcu_dereference_raw(fb->private_data));
 	module_put(THIS_MODULE);
-	printk(KERN_ERR "Deinitialization passed!\n");
+	printk(KERN_ERR "[CRR TX] Deinitialization passed!\n");
 }
 
 static struct fblock_factory fb_crr_tx_factory = {
